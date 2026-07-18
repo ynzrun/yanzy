@@ -1500,6 +1500,19 @@
     gap: 76px;
     pointer-events: none;
     z-index: 14;
+    opacity: 1;
+    transition: opacity .3s;
+  }
+  /* Sembunyikan otomatis (bersama seekbar) saat video sedang diputar & tidak ada interaksi */
+  .player-box.controls-hidden .player-skip-controls,
+  .player-box.controls-hidden .video-seekbar {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .player-box.controls-hidden .skip-btn,
+  .player-box.controls-hidden .video-seekbar-track,
+  .player-box.controls-hidden .video-minimize-btn {
+    pointer-events: none;
   }
 
   .skip-btn {
@@ -3434,6 +3447,14 @@ document.querySelectorAll('#statusFilters .chip').forEach(chip => {
 // PAGE SWITCHING (dengan dukungan tombol Back browser)
 // ============================================================
 function showPageOnly(pageName) {
+  // Kalau sedang meninggalkan halaman detail (misal ke Home/Profil/Riwayat lewat nav bawah),
+  // hentikan video yang mungkin masih berjalan di latar & simpan posisi tontonan ke riwayat.
+  const wasOnDetail = !!(document.getElementById('page-detail') && document.getElementById('page-detail').classList.contains('active'));
+  if (wasOnDetail && pageName !== 'detail') {
+    saveWatchProgress();
+    pausePlayerOnLeave();
+  }
+
   if (pageName !== 'riwayat' && historySelectMode) {
     // Reset mode pilih diam-diam kalau user pindah halaman lain saat masih memilih
     historySelectMode = false;
@@ -3624,6 +3645,7 @@ function openDetail(item, fromPage) {
 }
 
 function closeDetail() {
+  saveWatchProgress();
   resetPlayerSource();
   document.getElementById('playerBox').classList.remove('video-active');
   document.getElementById('playerOverlay').classList.remove('is-playing');
@@ -3631,6 +3653,8 @@ function closeDetail() {
   currentDetailItem = null;
   navigateTo(detailReturnPage);
 }
+
+window.addEventListener('beforeunload', () => { saveWatchProgress(); });
 
 function renderDetailPage(item) {
   const safeTitle = escapeHtml(item.title);
@@ -3659,14 +3683,6 @@ function renderDetailPage(item) {
   document.getElementById('playerBox').classList.remove('video-active');
   document.getElementById('playerOverlay').classList.remove('is-playing');
   document.querySelector('.play-btn').innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>`;
-
-  // Set sumber video (untuk tipe episodic: anime/donghua/film) — pakai video
-  // yang diunggah admin lewat Panel Admin jika ada, kalau tidak pakai video sampel.
-  // setEpisodeSource otomatis deteksi apakah link-nya YouTube atau file mp4/m3u8 langsung.
-  const _kind = contentKind(item.type);
-  if (isEpisodicKind(_kind)) {
-    setEpisodeSource(getEpisodeVideoUrl(item, 0, 1));
-  }
 
   // Selalu mulai dari resolusi 1080p setiap kali membuka judul baru
   setResolution('1080p');
@@ -3698,6 +3714,21 @@ function renderDetailPage(item) {
 
   updateDetailFavButton(!!favorites[item.id]);
   renderDetailSelector(item);
+
+  // Lanjutkan dari posisi terakhir menonton (season/episode/menit) kalau tersimpan di riwayat.
+  // Kalau tidak ada progres tersimpan, mulai seperti biasa dari Season 1 Episode 1.
+  const _kind2 = contentKind(item.type);
+  if (isEpisodicKind(_kind2)) {
+    const progress = item.watchProgress;
+    if (progress && progress.episode) {
+      const sIdx = Math.min(Math.max(progress.seasonIdx || 0, 0), detailSeasons ? detailSeasons.length - 1 : 0);
+      if (sIdx > 0) chooseSeason(sIdx);
+      chooseEpisode(progress.episode);
+      _pendingResumeTime = progress.time || 0; // override reset dari chooseEpisode di atas
+    } else {
+      chooseEpisode(1);
+    }
+  }
 }
 
 function updateDetailFavButton(isFav) {
@@ -3716,6 +3747,7 @@ function toggleFavoriteFromDetail() {
 }
 
 function handlePlayerOverlayClick() {
+  bumpPlayerControlsVisibility();
   if (currentVideoMode === 'youtube') {
     if (!ytPlayer || !ytPlayer.getPlayerState) return;
     const state = ytPlayer.getPlayerState();
@@ -3899,6 +3931,7 @@ function getEpisodeVideoUrl(item, seasonIdx, ep) {
 }
 
 function chooseEpisode(ep) {
+  _pendingResumeTime = 0;
   detailActiveEpisode = ep;
   document.getElementById('episodeSelectLabel').textContent = 'Episode ' + ep;
   document.querySelectorAll('#episodeSelectMenu .custom-select-option').forEach(o => {
@@ -4608,6 +4641,46 @@ let playerSpeed = 1;
 let currentVideoMode = 'native';  // 'native' (tag <video>) | 'youtube' (YT IFrame API)
 let ytPlayer = null;
 let ytPollTimer = null;
+let _pendingResumeTime = 0; // detik yang akan di-seek begitu video/YT siap dimuat (untuk lanjutkan tontonan)
+
+// Simpan posisi terakhir menonton (season/episode/menit) ke item aktif + riwayat + localStorage
+function saveWatchProgress() {
+  if (!currentDetailItem) return;
+  if (!isEpisodicKind(contentKind(currentDetailItem.type))) return;
+
+  const time = currentVideoMode === 'youtube'
+    ? (ytPlayer && ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() : 0)
+    : (document.getElementById('playerVideo') ? document.getElementById('playerVideo').currentTime : 0);
+  const dur = currentVideoMode === 'youtube'
+    ? (ytPlayer && ytPlayer.getDuration ? ytPlayer.getDuration() : 0)
+    : (document.getElementById('playerVideo') ? document.getElementById('playerVideo').duration : 0);
+
+  if (!time || time < 3) return; // belum benar-benar mulai nonton, tidak perlu disimpan
+
+  const progress = {
+    seasonIdx: detailActiveSeasonIdx || 0,
+    episode: detailActiveEpisode || 1,
+    time: time,
+    duration: isFinite(dur) ? dur : 0
+  };
+  currentDetailItem.watchProgress = progress;
+
+  const hIdx = history_.findIndex(i => i.id === currentDetailItem.id);
+  if (hIdx !== -1) {
+    history_[hIdx].watchProgress = progress;
+    try { localStorage.setItem('yanzydev_history', JSON.stringify(history_)); } catch (e) {}
+  }
+}
+
+// Hentikan pemutaran (dipanggil saat pindah halaman/keluar dari detail) tanpa menghancurkan player
+function pausePlayerOnLeave() {
+  if (currentVideoMode === 'youtube') {
+    if (ytPlayer && ytPlayer.pauseVideo) { try { ytPlayer.pauseVideo(); } catch (e) {} }
+  } else {
+    const video = document.getElementById('playerVideo');
+    if (video && !video.paused) video.pause();
+  }
+}
 
 function formatPlayerTime(sec) {
   if (!isFinite(sec) || sec < 0) sec = 0;
@@ -4691,6 +4764,10 @@ function createYTPlayer(videoId) {
     events: {
       onReady: (e) => {
         e.target.setVolume(Math.round(playerVolume * 100));
+        if (_pendingResumeTime > 0) {
+          try { e.target.seekTo(_pendingResumeTime, true); } catch (err) {}
+          _pendingResumeTime = 0;
+        }
         startYtPolling();
       },
       onStateChange: onYtStateChange
@@ -4707,9 +4784,12 @@ function onYtStateChange(e) {
     box.classList.add('video-active');
     overlay.classList.add('is-playing');
     if (btn) btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
+    scheduleHidePlayerControls();
   } else if (e.data === YT.PlayerState.PAUSED || e.data === YT.PlayerState.ENDED) {
     overlay.classList.remove('is-playing');
     if (btn) btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>`;
+    box.classList.remove('controls-hidden');
+    clearTimeout(_controlsHideTimer);
   }
 }
 
@@ -4753,6 +4833,37 @@ function isFsMode() {
   return w && w.classList.contains('fs-mode');
 }
 
+/* ---------- Auto-hide seekbar & tombol skip ±10s ---------- */
+// Tampil saat ada interaksi, sembunyi otomatis 3 detik setelah video diputar & tidak disentuh.
+// Tetap tampil selama video di-pause (belum/berhenti diputar).
+let _controlsHideTimer = null;
+
+function isPlayerCurrentlyPlaying() {
+  const overlay = document.getElementById('playerOverlay');
+  return !!(overlay && overlay.classList.contains('is-playing'));
+}
+
+function scheduleHidePlayerControls() {
+  clearTimeout(_controlsHideTimer);
+  _controlsHideTimer = setTimeout(() => {
+    if (!isPlayerCurrentlyPlaying()) return; // jangan sembunyikan saat pause
+    const box = document.getElementById('playerBox');
+    if (box) box.classList.add('controls-hidden');
+  }, 3000);
+}
+
+// Panggil ini di setiap interaksi (tap, skip, drag seekbar, swipe gesture)
+function bumpPlayerControlsVisibility() {
+  const box = document.getElementById('playerBox');
+  if (!box) return;
+  box.classList.remove('controls-hidden');
+  if (isPlayerCurrentlyPlaying()) {
+    scheduleHidePlayerControls();
+  } else {
+    clearTimeout(_controlsHideTimer);
+  }
+}
+
 function applyPlayerBrightness() {
   const box = document.getElementById('playerBox');
   if (box) box.style.filter = `brightness(${playerBrightness})`;
@@ -4776,6 +4887,7 @@ function exitPlayerFullscreen() {
 /* ---------- Skip ±10s dengan akumulator 800ms ---------- */
 
 function doPlayerSkip(seconds) {
+  bumpPlayerControlsVisibility();
   if (currentVideoMode === 'youtube' && ytPlayer && ytPlayer.getDuration) {
     const dur = ytPlayer.getDuration();
     const cur = ytPlayer.getCurrentTime();
@@ -4895,6 +5007,7 @@ function initPlayerGestures() {
     if (!isFsMode()) return;
     if (e.target.closest('.skip-btn') || e.target.closest('.video-minimize-btn')) return;
     if (e.touches.length !== 1) return;
+    bumpPlayerControlsVisibility();
 
     const t = e.touches[0];
     _touchInitX = t.clientX;
@@ -4990,6 +5103,7 @@ function initPlayerVideo() {
     overlay.classList.add('is-playing');
     const btn = _playBtn();
     if (btn) btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
+    scheduleHidePlayerControls();
   });
 
   // Saat pause/selesai: tampilkan overlay dengan ikon play
@@ -4997,6 +5111,8 @@ function initPlayerVideo() {
     overlay.classList.remove('is-playing');
     const btn = _playBtn();
     if (btn) btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>`;
+    box.classList.remove('controls-hidden');
+    clearTimeout(_controlsHideTimer);
   };
   video.addEventListener('pause', onStop);
   video.addEventListener('ended', onStop);
@@ -5015,7 +5131,14 @@ function initPlayerVideo() {
     if (reNormal) reNormal.textContent = '-' + formatPlayerTime(video.duration - video.currentTime);
   }
 
-  video.addEventListener('loadedmetadata', updateTimeLabels);
+  video.addEventListener('loadedmetadata', () => {
+    updateTimeLabels();
+    if (_pendingResumeTime > 0 && isFinite(video.duration) && video.duration > 0) {
+      video.currentTime = Math.min(_pendingResumeTime, Math.max(0, video.duration - 1));
+      _pendingResumeTime = 0;
+      updateTimeLabels();
+    }
+  });
 
   video.addEventListener('timeupdate', () => {
     if (!video.duration) return;
